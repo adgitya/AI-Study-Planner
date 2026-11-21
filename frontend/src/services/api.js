@@ -91,6 +91,7 @@ export const progressAPI = {
 
 export const aiAPI = {
   chat: (data) => api.post('/ai/chat', data),
+  getStatus: () => api.get('/ai/status'),
   getConversations: () => api.get('/ai/conversations'),
   clearConversation: (id) => api.delete(`/ai/conversations/${id}`),
   generateQuiz: (data) => api.post('/ai/generate-quiz', data),

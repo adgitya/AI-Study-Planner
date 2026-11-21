@@ -227,6 +227,13 @@ class ChatConversationResponse(BaseModel):
     created_at: datetime
     messages: List[ChatMessageResponse] = []
 
+class ChatResponseData(BaseModel):
+    conversation_id: int
+    user_message: ChatMessageResponse
+    assistant_message: ChatMessageResponse
+    mode: str = "openai"  # "openai" or "fallback"
+    error_detail: Optional[str] = None
+
 
 # --- AI QUIZ SCHEMAS ---
 class QuizGenerateRequest(BaseModel):

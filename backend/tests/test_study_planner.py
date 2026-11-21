@@ -358,6 +358,99 @@ def test_partial_quiz_submission_and_empty_progress():
     unanswered = [q for q in eval_data["questions"] if q["selected_option"] == "Unanswered"]
     assert len(unanswered) == 2
 
+def test_ai_different_questions_different_responses():
+    login_resp = client.post("/api/v1/auth/login", json={
+        "email": "alice@example.com",
+        "password": "Password123!"
+    })
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # 1. Ask about Pomodoro technique
+    r1 = client.post("/api/v1/ai/chat", headers=headers, json={"content": "Explain the Pomodoro technique with an example."})
+    assert r1.status_code == 200
+    msg1 = r1.json()["assistant_message"]["content"]
+    assert "pomodoro" in msg1.lower()
+    assert "25" in msg1
+
+    # 2. Ask about Active recall vs passive learning
+    r2 = client.post("/api/v1/ai/chat", headers=headers, json={"content": "What is the difference between active recall and passive learning?"})
+    assert r2.status_code == 200
+    msg2 = r2.json()["assistant_message"]["content"]
+    assert "active recall" in msg2.lower()
+    assert "passive" in msg2.lower()
+
+    # 3. Ask about Binary search with C++ and Python
+    r3 = client.post("/api/v1/ai/chat", headers=headers, json={"content": "Explain binary search with a simple C++ and Python example."})
+    assert r3.status_code == 200
+    msg3 = r3.json()["assistant_message"]["content"]
+    assert "binary search" in msg3.lower()
+    assert "cpp" in msg3.lower() or "c++" in msg3.lower()
+
+    # 4. Ask about hours studied this week
+    r4 = client.post("/api/v1/ai/chat", headers=headers, json={"content": "How many hours have I studied this week?"})
+    assert r4.status_code == 200
+    msg4 = r4.json()["assistant_message"]["content"]
+    assert "hours" in msg4.lower()
+
+    # 5. Ask for study routine based on available time
+    r5 = client.post("/api/v1/ai/chat", headers=headers, json={"content": "Suggest a study routine based on my available time."})
+    assert r5.status_code == 200
+    msg5 = r5.json()["assistant_message"]["content"]
+    assert "routine" in msg5.lower()
+
+    # Verify that different questions receive completely different responses
+    responses = [msg1, msg2, msg3, msg4, msg5]
+    assert len(set(responses)) == 5, "Every question must receive a distinct, relevant answer!"
+
+def test_scheduler_strict_constraints():
+    login_resp = client.post("/api/v1/auth/login", json={
+        "email": "alice@example.com",
+        "password": "Password123!"
+    })
+    token = login_resp.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Fetch preferences
+    prof = client.get("/api/v1/profile", headers=headers).json()
+    start_min = int(prof["preferred_start_time"].split(":")[0]) * 60 + int(prof["preferred_start_time"].split(":")[1])
+    end_min = int(prof["preferred_end_time"].split(":")[0]) * 60 + int(prof["preferred_end_time"].split(":")[1])
+    daily_limit = int(prof["daily_study_hours"] * 60)
+    break_min = prof["break_duration"]
+
+    # Generate plan
+    plan_resp = client.post("/api/v1/plans/generate", headers=headers, json={
+        "plan_type": "weekly",
+        "regenerate": True
+    })
+    assert plan_resp.status_code == 200
+    sessions = plan_resp.json()["sessions"]
+    assert len(sessions) > 0
+
+    sessions_by_day = {}
+    for s in sessions:
+        sessions_by_day.setdefault(s["session_date"], []).append(s)
+
+    for day, day_sessions in sessions_by_day.items():
+        total_day_mins = sum(s["duration_minutes"] for s in day_sessions)
+        assert total_day_mins <= daily_limit, f"Day {day} exceeded daily limit: {total_day_mins} > {daily_limit}"
+
+        day_sessions.sort(key=lambda x: x["start_time"])
+        for i, sess in enumerate(day_sessions):
+            sh, sm = map(int, sess["start_time"].split(":"))
+            eh, em = map(int, sess["end_time"].split(":"))
+            s_min = sh * 60 + sm
+            e_min = eh * 60 + em
+
+            assert s_min >= start_min, f"Session started earlier than preferred on {day}: {sess['start_time']}"
+            assert e_min <= end_min, f"Session ended later than preferred on {day}: {sess['end_time']}"
+
+            if i < len(day_sessions) - 1:
+                next_sh, next_sm = map(int, day_sessions[i + 1]["start_time"].split(":"))
+                next_s_min = next_sh * 60 + next_sm
+                # Check no overlap and break respected
+                assert next_s_min >= e_min + break_min, f"Break duration violated between sessions on {day}"
+
 def test_user_data_isolation():
     # Register User 2 (Bob)
     reg_resp = client.post("/api/v1/auth/register", json={

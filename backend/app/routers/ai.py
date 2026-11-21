@@ -1,16 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Dict, Any, Optional
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.all_models import (
     User, Subject, Topic, Examination, StudySession,
-    ChatConversation, ChatMessage, QuizAttempt, QuizQuestion,
+    ChatConversation, ChatMessage, QuizAttempt, QuizQuestion, ProgressRecord,
     TopicStatus
 )
 from app.schemas.all_schemas import (
-    ChatMessageCreate, ChatConversationResponse,
+    ChatMessageCreate, ChatConversationResponse, ChatResponseData,
     QuizGenerateRequest, QuizSubmitRequest, QuizAttemptResponse
 )
 from app.services.ai_service import ai_service
@@ -18,12 +19,30 @@ from app.services.quiz_service import quiz_service
 
 router = APIRouter(prefix="/ai", tags=["AI & Assistant"])
 
-@router.post("/chat")
+@router.get("/status")
+def get_ai_status(
+    current_user: User = Depends(get_current_user)
+):
+    """Returns whether the live OpenAI integration or Fallback Knowledge Engine is active."""
+    client, err_code = ai_service._get_client()
+    return {
+        "is_available": client is not None,
+        "model": ai_service.model,
+        "mode": "openai" if client is not None else "fallback",
+        "error_code": err_code
+    }
+
+@router.post("/chat", response_model=ChatResponseData)
 def chat_with_assistant(
     chat_in: ChatMessageCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+    # Validate non-empty message
+    clean_content = chat_in.content.strip()
+    if not clean_content:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Message cannot be empty")
+
     # 1. Fetch or create conversation
     conv = None
     if chat_in.conversation_id:
@@ -33,19 +52,19 @@ def chat_with_assistant(
         ).first()
 
     if not conv:
-        conv = ChatConversation(user_id=current_user.id, title=chat_in.content[:40] + "...")
+        conv = ChatConversation(user_id=current_user.id, title=clean_content[:40] + ("..." if len(clean_content) > 40 else ""))
         db.add(conv)
         db.commit()
         db.refresh(conv)
 
     # 2. Record student message
-    user_msg = ChatMessage(conversation_id=conv.id, sender="user", content=chat_in.content)
+    user_msg = ChatMessage(conversation_id=conv.id, sender="user", content=clean_content)
     db.add(user_msg)
     db.commit()
 
     # 3. Assemble verified student context from database
     subjects = db.query(Subject).filter(Subject.user_id == current_user.id).all()
-    exams = db.query(Examination).filter(Examination.user_id == current_user.id).all()
+    all_exams = db.query(Examination).filter(Examination.user_id == current_user.id).all()
     pending_topics = db.query(Topic).join(Subject).filter(
         Subject.user_id == current_user.id,
         Topic.status != TopicStatus.COMPLETED.value
@@ -53,34 +72,66 @@ def chat_with_assistant(
 
     today = date.today()
     exam_context = []
-    for e in exams:
+    for e in all_exams:
         ed = e.exam_date.date() if isinstance(e.exam_date, datetime) else e.exam_date
-        exam_context.append({
-            "title": e.title,
-            "subject_name": e.subject.name if e.subject else "General",
-            "days_remaining": (ed - today).days,
-            "priority": e.priority
-        })
+        delta = (ed - today).days
+        # Strictly upcoming exams (filter out past exams!)
+        if delta >= 0:
+            exam_context.append({
+                "title": e.title,
+                "subject_name": e.subject.name if e.subject else "General",
+                "days_remaining": delta,
+                "priority": e.priority
+            })
+
+    # Sort upcoming exams nearest first
+    exam_context.sort(key=lambda x: x["days_remaining"])
+
+    # Calculate actual hours studied this week
+    week_ago_str = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    progress_mins = db.query(func.sum(ProgressRecord.duration_minutes)).filter(
+        ProgressRecord.user_id == current_user.id,
+        ProgressRecord.study_date >= week_ago_str
+    ).scalar() or 0
+    studied_hours_this_week = round(progress_mins / 60.0, 1)
+
+    # Calculate streak
+    streak_records = db.query(ProgressRecord.study_date).filter(
+        ProgressRecord.user_id == current_user.id
+    ).distinct().all()
+    streak_dates = {r[0] for r in streak_records}
+    streak = 0
+    check_d = today
+    # If today hasn't been logged yet, check yesterday
+    if today.strftime("%Y-%m-%d") not in streak_dates:
+        check_d = today - timedelta(days=1)
+    while check_d.strftime("%Y-%m-%d") in streak_dates:
+        streak += 1
+        check_d -= timedelta(days=1)
 
     student_context = {
         "student_name": current_user.full_name,
         "daily_study_hours": current_user.preferences.daily_study_hours if current_user.preferences else 4.0,
+        "preferred_start_time": current_user.preferences.preferred_start_time if current_user.preferences else "09:00",
+        "preferred_end_time": current_user.preferences.preferred_end_time if current_user.preferences else "21:00",
         "learning_style": current_user.preferences.preferred_learning_style if current_user.preferences else "Visual",
         "academic_goals": current_user.preferences.academic_goals if current_user.preferences else "",
         "subjects": [s.name for s in subjects],
         "upcoming_exams": exam_context,
-        "pending_topics": [t.name for t in pending_topics[:15]]
+        "pending_topics": [t.name for t in pending_topics[:15]],
+        "studied_hours_this_week": studied_hours_this_week,
+        "current_streak_days": streak
     }
 
-    # 4. History
+    # 4. History (last 10 messages)
     history_records = db.query(ChatMessage).filter(ChatMessage.conversation_id == conv.id).order_by(ChatMessage.id.asc()).all()
     conv_history = [{"role": "assistant" if m.sender == "assistant" else "user", "content": m.content} for m in history_records[:-1]]
 
     # 5. Generate contextual response
-    assistant_reply = ai_service.generate_chat_response(
+    assistant_reply, mode, err_detail = ai_service.generate_chat_response(
         student_context=student_context,
         conversation_history=conv_history,
-        user_message=chat_in.content
+        user_message=clean_content
     )
 
     # 6. Record assistant message
@@ -91,6 +142,8 @@ def chat_with_assistant(
 
     return {
         "conversation_id": conv.id,
+        "mode": mode,
+        "error_detail": err_detail,
         "user_message": {
             "id": user_msg.id,
             "sender": user_msg.sender,

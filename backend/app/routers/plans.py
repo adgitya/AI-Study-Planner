@@ -145,8 +145,12 @@ def update_session_status(
 
     actual_duration = status_in.actual_minutes if status_in.actual_minutes is not None else session.duration_minutes
 
+    # If reverted to Pending or Skipped, clean up any ProgressRecords for this session
+    if status_in.status in [SessionStatus.PENDING.value, SessionStatus.SKIPPED.value, SessionStatus.NOT_COMPLETED.value]:
+        db.query(ProgressRecord).filter(ProgressRecord.session_id == session.id).delete()
+
     # If completed or partially completed, log a ProgressRecord and update Topic stats
-    if status_in.status in [SessionStatus.COMPLETED.value, SessionStatus.PARTIALLY_COMPLETED.value]:
+    elif status_in.status in [SessionStatus.COMPLETED.value, SessionStatus.PARTIALLY_COMPLETED.value]:
         # Record progress
         prog = ProgressRecord(
             user_id=current_user.id,
